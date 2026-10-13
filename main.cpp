@@ -3,6 +3,7 @@
 
 
 #include <iostream>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <new>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 #include <cassert>
 #include <charconv>
 #include <chrono>
@@ -154,7 +156,7 @@ namespace {
 constexpr auto BOOK_BUFFER = 1'000'001;
 constexpr auto TEN_MILLION1 = 10'000'001;
 
-constexpr auto BITMAPSIZE = BOOK_BUFFER / 128;
+constexpr auto BITMAPSIZE = (BOOK_BUFFER + 127) / 128;
 
 //these 2 vectors will store the order ids of the HEAD of a doubly linked list
 //this doubly linked list is not a struct - it is a design.
@@ -203,13 +205,14 @@ static std::vector<__int128_t> bids_bitmap(BITMAPSIZE);
 static std::vector<__int128_t> asks_bitmap(BITMAPSIZE);
 static std::vector<__int128_t> orders_bitmap(BITMAPSIZE);
 
-constexpr auto SUMMARY = BITMAPSIZE / 128;
+constexpr auto SUMMARY = (BITMAPSIZE + 127) / 128;
 
 static std::vector<__int128_t> asks_summary(SUMMARY);
 static std::vector<__int128_t> bids_summary(SUMMARY);
 
 static std::int64_t master_ask_table = 0;
 static std::int64_t master_bid_table = 0;
+static bool benchmark_mode = false;
 
 /**
  * @brief Returns whether a bid order exists at a certain price
@@ -278,57 +281,83 @@ static int first_set_bit(const std::int64_t val) {
 
 static int last_set_bit(const std::int64_t val) {
     if (val == 0) return -1; // Not found
-    return 63 - __builtin_ctzll(val);
+    return 63 - __builtin_clzll(static_cast<std::uint64_t>(val));
 }
 
 static OrderID best_bid() {
     const std::int64_t first = last_set_bit(master_bid_table);
-    if (first == -1) return first;
-    if (const std::int64_t second = last_set_bit(bids_summary[first]); second == -1) return second;
-    const std::int64_t third = last_set_bit(bids_bitmap[first]);
-    if (third == -1) return third;
-    const OrderID final = bids_[third];
-    return final;
+    if (first == -1) return static_cast<OrderID>(NULL_ORDER_ID);
+    const std::int64_t second = last_set_bit(bids_summary[first]);
+    if (second == -1) return static_cast<OrderID>(NULL_ORDER_ID);
+    const auto word_index = static_cast<std::size_t>(first * 128 + second);
+    const std::int64_t third = last_set_bit(bids_bitmap[word_index]);
+    if (third == -1) return static_cast<OrderID>(NULL_ORDER_ID);
+    const auto price_index = word_index * 128 + static_cast<std::size_t>(third);
+    return bids_[price_index];
 }
 
 static OrderID best_ask() {
     const std::int64_t first = first_set_bit(master_ask_table);
-    if (first == -1) return first;
-    if (const std::int64_t second = first_set_bit(asks_summary[first]); second == -1) return second;
-    const std::int64_t third = first_set_bit(asks_bitmap[first]);
-    if (third == -1) return third;
-    const auto final = asks_[third];
-    return final;
+    if (first == -1) return static_cast<OrderID>(NULL_ORDER_ID);
+    const std::int64_t second = first_set_bit(asks_summary[first]);
+    if (second == -1) return static_cast<OrderID>(NULL_ORDER_ID);
+    const auto word_index = static_cast<std::size_t>(first * 128 + second);
+    const std::int64_t third = first_set_bit(asks_bitmap[word_index]);
+    if (third == -1) return static_cast<OrderID>(NULL_ORDER_ID);
+    const auto price_index = word_index * 128 + static_cast<std::size_t>(third);
+    return asks_[price_index];
 }
 
 
-static std::string format_price(const Price &price) {
-    auto digits = std::to_string(price._base);
-    std::size_t fractional_digits = 0;
-    for (auto scale = Price::_decimals; scale > 1; scale /= 10) {
-        ++fractional_digits;
-    }
-    if (fractional_digits == 0) {
-        return digits;
+static std::array<char, 32> format_price(const Price &price) {
+    std::array<char, 32> digits{};
+    std::array<char, 32> formatted{};
+    const auto [digits_end, error] =
+            std::to_chars(digits.data(), digits.data() + digits.size() - 1, price._base);
+    if (error != std::errc{}) {
+        return formatted;
     }
 
-    if (digits.size() <= fractional_digits) {
-        return "0." + std::string(fractional_digits - digits.size(), '0') + digits;
+    const auto digit_count = static_cast<std::size_t>(digits_end - digits.data());
+    constexpr std::size_t fractional_digits = DECIMAL_LIMIT;
+    const auto integer_digits = digit_count > fractional_digits ? digit_count - fractional_digits : 1;
+    const auto leading_zeroes = digit_count < fractional_digits + 1
+                                    ? fractional_digits + 1 - digit_count
+                                    : 0;
+
+    std::size_t output = 0;
+    for (std::size_t i = 0; i < integer_digits; ++i) {
+        formatted[output++] = i < leading_zeroes ? '0' : digits[i - leading_zeroes];
     }
-    digits.insert(digits.size() - fractional_digits, 1, '.');
-    return digits;
+    formatted[output++] = '.';
+    if (leading_zeroes != 0) {
+        for (std::size_t i = 0; i < fractional_digits; ++i) {
+            formatted[output++] = i < leading_zeroes - 1
+                                      ? '0'
+                                      : digits[i - (leading_zeroes - 1)];
+        }
+    } else {
+        for (std::size_t i = integer_digits; i < digit_count; ++i) {
+            formatted[output++] = digits[i];
+        }
+    }
+    formatted[output] = '\0';
+    return formatted;
 }
 
 static std::optional<Price> parse_price(const std::string_view text) {
-    std::string digits;
-    digits.reserve(text.size());
+    std::uint64_t base = 0;
     std::size_t fractional_digits = 0;
     bool after_decimal = false;
     bool saw_digit = false;
 
     for (const char ch: text) {
         if (ch >= '0' && ch <= '9') {
-            digits.push_back(ch);
+            const auto digit = static_cast<std::uint64_t>(ch - '0');
+            if (base > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+                return std::nullopt;
+            }
+            base = base * 10 + digit;
             saw_digit = true;
             if (after_decimal) {
                 ++fractional_digits;
@@ -344,12 +373,16 @@ static std::optional<Price> parse_price(const std::string_view text) {
         return std::nullopt;
     }
 
-    digits.append(static_cast<std::size_t>(DECIMAL_LIMIT) - fractional_digits, '0');
-
-    std::uint64_t base = 0;
-    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), base);
-    if (error != std::errc{} || end != digits.data() + digits.size() ||
-        base == 0 || base > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+    for (auto i = fractional_digits; i < static_cast<std::size_t>(DECIMAL_LIMIT); ++i) {
+        if (base > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) / 10) {
+            return std::nullopt;
+        }
+        base *= 10;
+    }
+    if (base == 0 || base > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        return std::nullopt;
+    }
+    if (base >= BOOK_BUFFER) {
         return std::nullopt;
     }
 
@@ -363,6 +396,8 @@ static bool parse_unsigned(const std::string_view text, std::size_t &value) {
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
     return error == std::errc{} && end == text.data() + text.size();
 }
+
+constexpr std::size_t COMMAND_BUFFER_SIZE = 256;
 
 static void set_order_state(const OrderID id, const bool active) {
     auto &word = orders_bitmap.at(id / 128);
@@ -443,23 +478,16 @@ static void set_ask_state(const std::int64_t base, const bool active) {
  */
 
 static bool evaluate() {
-    if (bids_.empty() || asks_.empty()) {
-        return false;
-    }
-
-    const auto price_bid = best_bid();
-    const auto best_bid_id = bids_[price_bid];
-
-    const auto price_ask = best_ask();
-    const auto best_ask_id = asks_[price_ask];
-
-
+    const auto best_bid_id = best_bid();
+    const auto best_ask_id = best_ask();
     if (best_bid_id == NULL_ORDER_ID || best_ask_id == NULL_ORDER_ID) {
         return false;
     }
 
     auto &bid = orders_[best_bid_id];
     auto &ask = orders_[best_ask_id];
+    const auto price_bid = static_cast<std::size_t>(bid._price._base);
+    const auto price_ask = static_cast<std::size_t>(ask._price._base);
 
     if (compare_prices(bid._price, ask._price) < 0) {
         return false;
@@ -482,7 +510,7 @@ static bool evaluate() {
             } else {
                 // if next is also NULL - the entire price level is now empty
                 bids_tails[price_bid] = NULL_ORDER_ID;
-                set_bid_state(orders_[price_bid]._price._base, false);
+                set_bid_state(bid._price._base, false);
             }
         }
 
@@ -521,7 +549,7 @@ static bool evaluate() {
             } else {
                 // if next is also NULL - the entire price level is now empty
                 asks_tails[price_ask] = NULL_ORDER_ID;
-                set_ask_state(orders_[price_ask]._price._base, false);
+                set_ask_state(ask._price._base, false);
             }
         }
 
@@ -576,6 +604,63 @@ const auto consume = [&](auto &opposite) {
 
 
 static void execute_market_order(Order &incoming) {
+    if (incoming._side == Side::BUY) {
+        // buy market order consumes asks, starting from the best (lowest) ask
+        while (incoming._quantity > 0) {
+            const auto best_ask_id = best_ask();
+            if (best_ask_id == static_cast<OrderID>(NULL_ORDER_ID)) break;
+
+            auto &resting = orders_[best_ask_id];
+            const auto ask_base = static_cast<std::size_t>(resting._price._base);
+            const auto traded = std::min(incoming._quantity, resting._quantity);
+
+            incoming._quantity -= traded;
+            resting._quantity -= traded;
+
+            if (resting._quantity == 0) {
+                // remove resting order from intrusive list
+                const auto next_id = resting.next;
+                asks_[ask_base] = next_id;
+
+                if (next_id != NULL_ORDER_ID) {
+                    orders_[next_id].prev = NULL_ORDER_ID;
+                } else {
+                    asks_tails[ask_base] = NULL_ORDER_ID;
+                    set_ask_state(ask_base, false); // clear bitmap bit if level is empty
+                }
+
+                set_order_state(best_ask_id, false);
+            }
+        }
+    } else {
+        // sell market order consumes bids, starting from the best (highest) bid
+        while (incoming._quantity > 0) {
+            const auto best_bid_id = best_bid();
+            if (best_bid_id == static_cast<OrderID>(NULL_ORDER_ID)) break;
+
+            auto &resting = orders_[best_bid_id];
+            const auto bid_base = static_cast<std::size_t>(resting._price._base);
+            const auto traded = std::min(incoming._quantity, resting._quantity);
+
+            incoming._quantity -= traded;
+            resting._quantity -= traded;
+
+            if (resting._quantity == 0) {
+                // remove resting order from intrusive list
+                const auto next_id = resting.next;
+                bids_[bid_base] = next_id;
+
+                if (next_id != NULL_ORDER_ID) {
+                    orders_[next_id].prev = NULL_ORDER_ID;
+                } else {
+                    bids_tails[bid_base] = NULL_ORDER_ID;
+                    set_bid_state(bid_base, false); // clear bitmap bit if level is empty
+                }
+
+                set_order_state(best_bid_id, false);
+            }
+        }
+    }
 }
 
 
@@ -636,6 +721,8 @@ static void add_order(const Order &order_info) {
             set_ask_state(base, true);
         }
     }
+
+    set_order_state(id, true);
 
     // execute the matching for best bid and ask order until you can
     while (evaluate()) {
@@ -777,7 +864,7 @@ static void modify_order(const OrderID order_id,
 
 static Price get_best_bid() {
     const auto bid = best_bid();
-    if (bid == 01) {
+    if (bid == static_cast<OrderID>(NULL_ORDER_ID)) {
         return INVALID;
     }
     return orders_[bid]._price;
@@ -785,7 +872,7 @@ static Price get_best_bid() {
 
 static Price get_best_ask() {
     const auto ask = best_ask();
-    if (ask == 01) {
+    if (ask == static_cast<OrderID>(NULL_ORDER_ID)) {
         return INVALID;
     }
     return orders_[ask]._price;
@@ -807,7 +894,7 @@ static void get_top_levels(const size_t depth,
         const int master_bit = last_set_bit(master_bids);
         if (master_bit < 0) break;
 
-        std::int64_t summary_word = bids_summary[master_bit];
+        __int128_t summary_word = bids_summary[master_bit];
         while (summary_word != 0 && bids_out.size() < depth) {
             const int summary_bit = last_set_bit(summary_word);
             if (summary_bit < 0) break;
@@ -846,7 +933,7 @@ static void get_top_levels(const size_t depth,
         const int master_bit = first_set_bit(master_asks);
         if (master_bit < 0) break;
 
-        std::int64_t summary_word = asks_summary[master_bit];
+        __int128_t summary_word = asks_summary[master_bit];
         while (summary_word != 0 && asks_out.size() < depth) {
             const int summary_bit = first_set_bit(summary_word);
             if (summary_bit < 0) break;
@@ -893,23 +980,18 @@ static std::mutex dashboard_mutex;
 static DashboardSnapshot dashboard_snapshot;
 
 static void publish_dashboard_snapshot() {
-    DashboardSnapshot next;
-    get_top_levels(10, next.bids, next.asks);
-
     std::lock_guard lock(dashboard_mutex);
-    next.input = dashboard_snapshot.input;
-    next.status = dashboard_snapshot.status;
-    dashboard_snapshot = std::move(next);
+    get_top_levels(10, dashboard_snapshot.bids, dashboard_snapshot.asks);
 }
 
-static void update_dashboard_input(const std::string &input) {
+static void update_dashboard_input(const std::string_view input) {
     std::lock_guard lock(dashboard_mutex);
     dashboard_snapshot.input = input;
 }
 
-static void update_dashboard_status(std::string status) {
+static void update_dashboard_status(const std::string_view status) {
     std::lock_guard lock(dashboard_mutex);
-    dashboard_snapshot.status = std::move(status);
+    dashboard_snapshot.status = status;
 }
 
 static void render_dashboard() {
@@ -929,6 +1011,12 @@ static void render_dashboard() {
     std::cout << "\033[2J\033[H"
             << "\033[1;36m"
             << "  ORDERBOOK  |  LIVE MARKET DEPTH"
+            << "\033[0m\n"
+            << "\033[1;36m"
+            << "  buy|sell <qty> [price] (omit price for market order)\n"
+            << "  modify <id> <buy|sell|-1> <qty|-1> <price|-1|-2>\n"
+            << "  cancel <id> | gbb | gba | gtl <levels>\n"
+            << "  reset | exit  (-1 keeps a modify field; -2 means market)\n"
             << "\033[0m\n";
 
     const auto render_side = [](const char *heading,
@@ -952,7 +1040,8 @@ static void render_dashboard() {
                                         1, static_cast<std::size_t>(scaled / side_max));
             const auto bounded_filled = std::min(filled, bar_width);
 
-            std::cout << "  " << std::setw(16) << format_price(price)
+            const auto formatted_price = format_price(price);
+            std::cout << "  " << std::setw(16) << formatted_price.data()
                     << std::setw(14) << quantity
                     << "  | " << color
                     << std::string(bounded_filled, '=')
@@ -1005,15 +1094,58 @@ namespace {
     };
 }
 
-static bool read_terminal_command(std::string &command) {
-    command.clear();
-    update_dashboard_input(command);
+enum class InputResult {
+    LINE,
+    TOO_LONG,
+    END
+};
+
+class CommandTimer {
+public:
+    CommandTimer(std::vector<std::uint64_t> &samples,
+                 const bool enabled,
+                 bool &capacity_exceeded)
+        : samples_(samples),
+          enabled_(enabled),
+          capacity_exceeded_(capacity_exceeded),
+          start_(enabled ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{}) {}
+
+    ~CommandTimer() {
+        if (!enabled_) {
+            return;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start_).count();
+        if (samples_.size() == samples_.capacity()) {
+            capacity_exceeded_ = true;
+            return;
+        }
+        samples_.push_back(static_cast<std::uint64_t>(elapsed));
+    }
+
+    void discard() {
+        enabled_ = false;
+    }
+
+private:
+    std::vector<std::uint64_t> &samples_;
+    bool enabled_;
+    bool &capacity_exceeded_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+static InputResult read_terminal_command(std::array<char, COMMAND_BUFFER_SIZE> &command,
+                                         std::size_t &length) {
+    length = 0;
+    bool too_long = false;
+    update_dashboard_input({});
 
     while (true) {
         pollfd input_fd{STDIN_FILENO, POLLIN, 0};
         const auto poll_result = poll(&input_fd, 1, 100);
         if (poll_result < 0) {
-            return false;
+            return InputResult::END;
         }
         if (poll_result == 0) {
             continue;
@@ -1022,32 +1154,57 @@ static bool read_terminal_command(std::string &command) {
         char ch = '\0';
         const auto bytes_read = read(STDIN_FILENO, &ch, 1);
         if (bytes_read <= 0) {
-            return false;
+            return InputResult::END;
         }
         if (ch == '\n' || ch == '\r') {
-            update_dashboard_input("");
-            return true;
+            command[length] = '\0';
+            update_dashboard_input({});
+            return too_long ? InputResult::TOO_LONG : InputResult::LINE;
         }
-        if (ch == 4 && command.empty()) {
-            return false;
-        }
-        if (ch == 3) {
-            return false;
+        if ((ch == 4 && length == 0) || ch == 3) {
+            return InputResult::END;
         }
         if (ch == 127 || ch == '\b') {
-            if (!command.empty()) {
-                command.pop_back();
-                update_dashboard_input(command);
+            if (length != 0 && !too_long) {
+                command[--length] = '\0';
+                update_dashboard_input(std::string_view(command.data(), length));
             }
             continue;
         }
         if (ch >= 32 && ch < 127) {
-            command.push_back(ch);
-            update_dashboard_input(command);
+            if (length + 1 < command.size()) {
+                command[length++] = ch;
+                command[length] = '\0';
+                update_dashboard_input(std::string_view(command.data(), length));
+            } else {
+                too_long = true;
+            }
         }
     }
 }
 
+static InputResult read_batch_command(std::array<char, COMMAND_BUFFER_SIZE> &command,
+                                      std::size_t &length) {
+    length = 0;
+    bool too_long = false;
+    char ch = '\0';
+    while (std::cin.get(ch)) {
+        if (ch == '\n') {
+            command[length] = '\0';
+            return too_long ? InputResult::TOO_LONG : InputResult::LINE;
+        }
+        if (length + 1 < command.size()) {
+            command[length++] = ch;
+        } else {
+            too_long = true;
+        }
+    }
+    if (length == 0 && !too_long) {
+        return InputResult::END;
+    }
+    command[length] = '\0';
+    return too_long ? InputResult::TOO_LONG : InputResult::LINE;
+}
 
 //this function is only for convenience - there wouldn't be any moment in HFT industry when you would want to reset an orderbook in live prod
 
@@ -1055,30 +1212,61 @@ static bool read_terminal_command(std::string &command) {
  * if you are calling this function - you are either very smart or so dumb that you cannot even comprehend the level of your dumbness UwU
  */
 static void reset() {
-    asks_ = {};
-    bids_ = {};
-    orders_.clear();
-    std::cout << "EVERYTHING ERASED." << "\n";
+    std::ranges::fill(bids_, NULL_ORDER_ID);
+    std::ranges::fill(bids_tails, NULL_ORDER_ID);
+    std::ranges::fill(asks_, NULL_ORDER_ID);
+    std::ranges::fill(asks_tails, NULL_ORDER_ID);
+    std::ranges::fill(bids_bitmap, 0);
+    std::ranges::fill(asks_bitmap, 0);
+    std::ranges::fill(orders_bitmap, 0);
+    std::ranges::fill(bids_summary, 0);
+    std::ranges::fill(asks_summary, 0);
+    master_bid_table = 0;
+    master_ask_table = 0;
+    if (!benchmark_mode) {
+        std::cout << "EVERYTHING ERASED." << "\n";
+    }
 }
 
-constexpr std::string BUY = "buy";
-constexpr std::string SELL = "sell";
-constexpr std::string MODIFY = "modify";
-constexpr std::string RESET = "reset";
-constexpr std::string CANCEL = "cancel";
-constexpr std::string GET_BEST_BID = "gbb";
-constexpr std::string GET_BEST_ASK = "gba";
-constexpr std::string GET_TOP_LEVELS = "gtl";
+constexpr std::string_view BUY = "buy";
+constexpr std::string_view SELL = "sell";
+constexpr std::string_view MODIFY = "modify";
+constexpr std::string_view RESET = "reset";
+constexpr std::string_view CANCEL = "cancel";
+constexpr std::string_view GET_BEST_BID = "get_best_bid";
+constexpr std::string_view GET_BEST_ASK = "get_best_ask";
+constexpr std::string_view GET_TOP_LEVELS = "gtl";
 
 
-int main() {
-    //excluding the metadata overhead + null terminator - we have 231 bytes worth of space for commands - HIGHLY unlikely to do another heap alloc
-    std::string command;
-    std::vector<std::string> tokens; //at max 5 tokens
-    tokens.reserve(5);
-    command.reserve(CacheLineSize);
-    std::vector<PriceQuantityPair> bids_out(10);
-    std::vector<PriceQuantityPair> asks_out(10);
+int main(const int argc, char *argv[]) {
+    std::size_t benchmark_capacity = 0;
+    if (argc != 1) {
+        if (argc != 3 || std::string_view(argv[1]) != "--benchmark-capacity" ||
+            !parse_unsigned(argv[2], benchmark_capacity) || benchmark_capacity == 0) {
+            std::cerr << "Usage: " << argv[0]
+                      << " [--benchmark-capacity <command-count-capacity>]\n";
+            return 2;
+        }
+        benchmark_mode = true;
+    }
+
+    std::array<char, COMMAND_BUFFER_SIZE> command{};
+    std::array<std::string_view, 5> tokens{};
+    std::size_t command_length = 0;
+    std::size_t token_count = 0;
+    std::vector<std::uint64_t> command_latencies;
+    bool benchmark_capacity_exceeded = false;
+    if (benchmark_mode) {
+        command_latencies.reserve(benchmark_capacity);
+    }
+    std::vector<PriceQuantityPair> bids_out;
+    std::vector<PriceQuantityPair> asks_out;
+    bids_out.reserve(10);
+    asks_out.reserve(10);
+    dashboard_snapshot.bids.reserve(10);
+    dashboard_snapshot.asks.reserve(10);
+    dashboard_snapshot.input.reserve(COMMAND_BUFFER_SIZE);
+    dashboard_snapshot.status.reserve(128);
 
     const bool interactive = ENABLE_LIVE_DASHBOARD &&
                              isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
@@ -1100,85 +1288,114 @@ int main() {
     }
 
     while (true) {
-        if (interactive && terminal.active()) {
-            if (!read_terminal_command(command)) {
-                break;
-            }
-        } else if (!std::getline(std::cin, command)) {
+        const auto input_result = interactive && terminal.active()
+                                      ? read_terminal_command(command, command_length)
+                                      : read_batch_command(command, command_length);
+        if (input_result == InputResult::END) {
             break;
         }
+        if (input_result == InputResult::TOO_LONG) {
+            std::cerr << "Invalid command: input exceeds "
+                    << COMMAND_BUFFER_SIZE - 1 << " characters\n";
+            continue;
+        }
 
-        tokens.clear();
+        CommandTimer command_timer(command_latencies, benchmark_mode,
+                                   benchmark_capacity_exceeded);
+        const std::string_view command_view(command.data(), command_length);
+        token_count = 0;
         bool too_many_tokens = false;
 
-        for (std::size_t pos = 0; pos < command.size();) {
-            while (pos < command.size() &&
-                   std::isspace(static_cast<unsigned char>(command[pos]))) {
+        for (std::size_t pos = 0; pos < command_view.size();) {
+            while (pos < command_view.size() &&
+                   std::isspace(static_cast<unsigned char>(command_view[pos]))) {
                 ++pos;
             }
 
-            if (pos == command.size()) {
+            if (pos == command_view.size()) {
                 break;
             }
 
             const auto start = pos;
-            while (pos < command.size() &&
-                   !std::isspace(static_cast<unsigned char>(command[pos]))) {
+            while (pos < command_view.size() &&
+                   !std::isspace(static_cast<unsigned char>(command_view[pos]))) {
                 ++pos;
             }
 
-            if (tokens.size() == 5) {
+            if (token_count == tokens.size()) {
                 too_many_tokens = true;
                 break;
             }
 
-            tokens.emplace_back(command.data() + start, pos - start);
+            tokens[token_count++] = command_view.substr(start, pos - start);
         }
 
-        if (tokens.empty()) {
+        if (token_count == 0) {
+            command_timer.discard();
             continue;
         }
 
 
         if (too_many_tokens) {
+            std::cerr << "Invalid command: too many arguments\n";
             continue;
         }
 
         if (tokens[0] == "exit") {
-            if (tokens.size() != 1) {
+            command_timer.discard();
+            if (token_count != 1) {
                 continue;
             }
             break;
         }
         if (tokens[0] == CANCEL) {
             std::size_t id = 0;
-            if (tokens.size() != 2 || !parse_unsigned(tokens[1], id)) {
+            if (token_count != 2 || !parse_unsigned(tokens[1], id)) {
+                std::cerr << "Invalid cancel command\n";
                 continue;
             }
 
             cancel_order(id);
 
-
-            publish_dashboard_snapshot();
+            if (interactive && terminal.active()) {
+                publish_dashboard_snapshot();
+            }
         } else if (tokens[0] == GET_BEST_BID || tokens[0] == GET_BEST_ASK) {
-            if (tokens.size() != 1) {
+            if (token_count != 1) {
+                std::cerr << "Invalid best-price query\n";
                 continue;
             }
             const Price best = tokens[0] == GET_BEST_BID ? get_best_bid() : get_best_ask();
-
-            const auto result = std::string(tokens[0] == GET_BEST_BID ? "best_bid=" : "best_ask=") +
-                                (best._base == INVALID._base ? "-1" : format_price(best));
-            if (interactive && terminal.active()) {
-                update_dashboard_status(result);
-            } else {
-                std::cout << result << '\n';
+            if (!benchmark_mode) {
+                const auto formatted_price = format_price(best);
+                std::array<char, 64> result{};
+                const std::string_view prefix =
+                        tokens[0] == GET_BEST_BID ? "best_bid=" : "best_ask=";
+                auto output = result.data();
+                std::copy(prefix.begin(), prefix.end(), output);
+                output += prefix.size();
+                if (best._base == INVALID._base) {
+                    *output++ = '-';
+                    *output++ = '1';
+                } else {
+                    const std::string_view formatted(formatted_price.data());
+                    std::copy(formatted.begin(), formatted.end(), output);
+                    output += formatted.size();
+                }
+                *output = '\0';
+                if (interactive && terminal.active()) {
+                    update_dashboard_status(result.data());
+                } else {
+                    std::cout << result.data() << '\n';
+                }
             }
         } else if (tokens[0] == BUY || tokens[0] == SELL) {
             std::size_t quantity = 0;
-            const auto price = tokens.size() == 3 ? parse_price(tokens[2]) : std::optional<Price>{};
-            if ((tokens.size() != 2 && tokens.size() != 3) ||
+            const auto price = token_count == 3 ? parse_price(tokens[2]) : std::optional<Price>{};
+            if ((token_count != 2 && token_count != 3) ||
                 !parse_unsigned(tokens[1], quantity) ||
-                (tokens.size() == 3 && !price)) {
+                (token_count == 3 && !price)) {
+                std::cerr << "Invalid order command\n";
                 continue;
             }
 
@@ -1187,13 +1404,16 @@ int main() {
             Order temp_order{};
             temp_order._side = (tokens[0] == BUY) ? Side::BUY : Side::SELL;
             temp_order._quantity = quantity;
-            temp_order._price = (tokens.size() == 3) ? *price : MKTORDER;
+            temp_order._price = (token_count == 3) ? *price : MKTORDER;
 
             add_order(temp_order);
 
-            publish_dashboard_snapshot();
+            if (interactive && terminal.active()) {
+                publish_dashboard_snapshot();
+            }
         } else if (tokens[0] == RESET) {
-            if (tokens.size() != 1) {
+            if (token_count != 1) {
+                std::cerr << "Invalid reset command\n";
                 continue;
             }
 
@@ -1201,15 +1421,18 @@ int main() {
 
             reset();
 
-            publish_dashboard_snapshot();
+            if (interactive && terminal.active()) {
+                publish_dashboard_snapshot();
+            }
         } else if (tokens[0] == MODIFY) {
             std::size_t id = 0;
             std::size_t quantity = 0;
-            if (tokens.size() != 5 ||
+            if (token_count != 5 ||
                 !parse_unsigned(tokens[1], id) ||
                 (tokens[2] != "-1" && tokens[2] != BUY && tokens[2] != SELL) ||
                 (tokens[3] != "-1" && !parse_unsigned(tokens[3], quantity)) ||
                 (tokens[4] != "-1" && tokens[4] != "-2" && !parse_price(tokens[4]))) {
+                std::cerr << "Invalid modify command\n";
                 continue;
             }
 
@@ -1250,27 +1473,67 @@ int main() {
 
             modify_order(id, new_price, side, new_quantity);
 
-            publish_dashboard_snapshot();
-        } else if (tokens[0] == GET_TOP_LEVELS) {
-            if (tokens.size() != 2) {
-                continue;
+            if (interactive && terminal.active()) {
+                publish_dashboard_snapshot();
             }
-            const auto levels = stoi(tokens[1]);
-            if (levels > 10) {
+        } else if (tokens[0] == GET_TOP_LEVELS) {
+            std::size_t levels = 0;
+            if (token_count != 2 || !parse_unsigned(tokens[1], levels) || levels > 10) {
+                std::cerr << "Invalid top-level query\n";
                 continue;
             }
 
             get_top_levels(levels, bids_out, asks_out);
+            if (!benchmark_mode) {
+                for (const auto &[price, quantity]: bids_out) {
+                    const auto formatted_price = format_price(price);
+                    std::cout << "bid " << formatted_price.data() << ' ' << quantity << '\n';
+                }
+                for (const auto &[price, quantity]: asks_out) {
+                    const auto formatted_price = format_price(price);
+                    std::cout << "ask " << formatted_price.data() << ' ' << quantity << '\n';
+                }
+            }
+        } else {
             std::cerr << "Unknown command: " << tokens[0] << '\n';
             continue;
         }
 
-        std::cout << "[Parsed] : " << command << '\n';
+        if (!benchmark_mode) {
+            std::cout << "[Parsed] : " << command_view << '\n';
+        }
     }
 
     if (renderer.joinable()) {
         render_running.store(false, std::memory_order_release);
         renderer.join();
+    }
+
+    if (benchmark_mode) {
+        if (benchmark_capacity_exceeded) {
+            std::cerr << "Benchmark sample capacity exceeded; increase --benchmark-capacity\n";
+            return 2;
+        }
+        std::sort(command_latencies.begin(), command_latencies.end());
+        const auto total_ns = std::accumulate(command_latencies.begin(),
+                                              command_latencies.end(),
+                                              std::uint64_t{0});
+        const auto percentile = [&](const std::size_t percent) {
+            if (command_latencies.empty()) {
+                return std::uint64_t{0};
+            }
+            const auto rank = (command_latencies.size() * percent + 99) / 100;
+            return command_latencies[rank - 1];
+        };
+        std::cout << "Benchmark commands: " << command_latencies.size() << '\n'
+                  << "Total command time: " << total_ns << " ns\n";
+        if (!command_latencies.empty()) {
+            std::cout << "Mean latency: "
+                      << total_ns / command_latencies.size() << " ns/command\n";
+        }
+        std::cout << "p50 latency: " << percentile(50) << " ns\n"
+                  << "p90 latency: " << percentile(90) << " ns\n"
+                  << "p99 latency: " << percentile(99) << " ns\n";
     }
 
     return 0;
