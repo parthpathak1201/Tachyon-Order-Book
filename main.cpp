@@ -10,16 +10,35 @@
 #include <memory>
 #include <optional>
 #include <print>
+#include <iomanip>
 #include <string>
 #include <string_view>
 #include <new>
 #include <vector>
 #include <algorithm>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <map>
 #include <set>
+#include <mutex>
+#include <thread>
+#include <poll.h>
+#include <termios.h>
+#include <unistd.h>
 
+
+constexpr std::int64_t DECIMAL_LIMIT = 3;
+
+//TOGGLE THIS FOR THE LIVE ORDERBOOK TUI
+constexpr bool ENABLE_LIVE_DASHBOARD = false;
+constexpr std::int64_t PRICE_SCALE = [] {
+    std::int64_t scale = 1;
+    for (std::int64_t i = 0; i < DECIMAL_LIMIT; ++i) {
+        scale *= 10;
+    }
+    return scale;
+}();
 struct Order;
 using OrderID = size_t;
 using Quantity = size_t;
@@ -27,28 +46,40 @@ using Timestamp = std::chrono::steady_clock::time_point;
 
 constexpr auto CacheLineSize = std::hardware_destructive_interference_size;
 
+/**
+ * instead of a nullptr in typical LL structures - we will use the holy grail number for null
+ */
+constexpr auto NULL_ORDER_ID = -67;
 
 namespace {
-    //because the currency is not guaranteed to be a whole number - it could be 192.251, we can store the whole value and decimal separately
+    //because the price is not guaranteed to be a whole number - it could be 192.251, we can store the whole value and decimal separately
     //if the price is 123.456 - base will be 123456, decimal will be 1000 - technically we wont have anything greater than 1000
     //we are doing thing to ensure accuracy in our computations. floating point calculations are not completely deterministic on the big scale
     struct Price {
         std::int64_t _base = 0;
-        std::int64_t _decimals = 1;
+        static constexpr std::int64_t _decimals = PRICE_SCALE;
 
         Price() = default;
 
-        constexpr Price(const std::int64_t base, const std::int64_t decimals) : _base(base), _decimals(decimals) {
+        constexpr explicit Price(const std::int64_t base) : _base(base) {
         }
     };
 }
 
-static constexpr Price INVALID{-1, -1};
-static constexpr Price MKTORDER{-2, -2};
+static constexpr Price INVALID{-1};
+static constexpr Price MKTORDER{-2};
 
-// will keep on increasing
+/**
+ * There was no requirement as such for using std::atomic<T> here but I went ahead and did it anyways in case I ever incorporate multithreaded logic in this orderbook
+ *
+ * Behaves sort of like an arena - we have 1 million order objects allocated in compile time
+ */
 static std::atomic<OrderID> global_order_id = 0;
 
+/**
+ * Helper function for clocking current timestamp (used in adding new orders)
+ */
+static auto now() { return std::chrono::steady_clock::now(); }
 
 namespace {
     //because we are doing the simple stuff - only buy and sell (for now lol)
@@ -61,27 +92,39 @@ namespace {
 
 struct alignas(CacheLineSize) Order {
     OrderID _id{};
-    Price _price{};
-    Side _side{Side::VOID};
-    Quantity _quantity{};
-    Timestamp _timestamp{std::chrono::steady_clock::now()};
+    mutable Price _price{};
+    mutable Side _side{Side::VOID};
+    mutable Quantity _quantity{};
+
+    /**
+     *  Timestamp of the order - generated automatically when an order is filled.
+     *
+     *  Note that because the entire order object pool is allocated before the runtime begins - timestamps initially written are wrong.
+     *
+     *  On every order - a new timestamp is alloted to ensure determined behavior
+     */
+    mutable Timestamp _timestamp{std::chrono::steady_clock::now()};
+
+    // The order id of the bid/ask previous to this order in the price level
+    OrderID prev = NULL_ORDER_ID;
+    // The order id of the bid/ask next to this order in the price level
+    OrderID next = NULL_ORDER_ID;
 };
 
 using OrderPtr = std::unique_ptr<Order>;
 
 static int compare_prices(const Price &lhs, const Price &rhs) {
-    const auto left = static_cast<__int128_t>(lhs._base) * rhs._decimals;
-    const auto right = static_cast<__int128_t>(rhs._base) * lhs._decimals;
+    const auto left = static_cast<__int128_t>(lhs._base) * Price::_decimals;
+    const auto right = static_cast<__int128_t>(rhs._base) * Price::_decimals;
     return (left > right) - (left < right);
 }
 
 namespace {
-    struct cmp_bids {
+    struct [[maybe_unused]] cmp_bids {
         bool operator()(const OrderPtr *a, const OrderPtr *b) const {
             const Order &lhs = **a;
             const Order &rhs = **b;
-            const auto by_price = compare_prices(lhs._price, rhs._price);
-            if (by_price != 0) {
+            if (const auto by_price = compare_prices(lhs._price, rhs._price); by_price != 0) {
                 return by_price > 0;
             }
             if (lhs._timestamp != rhs._timestamp) {
@@ -93,12 +136,11 @@ namespace {
 }
 
 namespace {
-    struct cmp_asks {
+    struct [[maybe_unused]] cmp_asks {
         bool operator()(const OrderPtr *a, const OrderPtr *b) const {
             const Order &lhs = **a;
             const Order &rhs = **b;
-            const auto by_price = compare_prices(lhs._price, rhs._price);
-            if (by_price != 0) {
+            if (const auto by_price = compare_prices(lhs._price, rhs._price); by_price != 0) {
                 return by_price < 0;
             }
             if (lhs._timestamp != rhs._timestamp) {
@@ -109,18 +151,161 @@ namespace {
     };
 }
 
+constexpr auto BOOK_BUFFER = 1'000'001;
+constexpr auto TEN_MILLION1 = 10'000'001;
 
-static std::set<OrderPtr *, cmp_bids> bids_;
-static std::set<OrderPtr *, cmp_asks> asks_;
+constexpr auto BITMAPSIZE = BOOK_BUFFER / 128;
+
+//these 2 vectors will store the order ids of the HEAD of a doubly linked list
+//this doubly linked list is not a struct - it is a design.
+//we are also storing the tails of each DLL so we can instantly fetch the last order and append a new order and make that the new tail.
+
+/**
+ * stores the order ids of the different bid orders.
+ *
+ * index - price level (base value)
+ *
+ * value - order id of the head of the order DLL. NULL_ORDER_ID for no orders
+ */
+static std::vector<OrderID> bids_(BOOK_BUFFER, NULL_ORDER_ID);
+
+/**
+ * stores the order ids of the different bid orders.
+ *
+ * index - price level (base value)
+ *
+ * value - order id of the tail of the order DLL. NULL_ORDER_ID for no orders
+ */
+static std::vector<OrderID> bids_tails(BOOK_BUFFER, NULL_ORDER_ID);
+
+/**
+ * stores the order ids of the different ask orders.
+ *
+ * index - price level (base value)
+ *
+ * value - order id of the head of the order DLL. NULL_ORDER_ID for no orders
+ */
+static std::vector<OrderID> asks_(BOOK_BUFFER, NULL_ORDER_ID);
+
+/**
+ * stores the order ids of the different ask orders.
+ *
+ * index - price level (base value)
+ *
+ * value - order id of the tail of the order DLL. NULL_ORDER_ID for no orders
+ */
+static std::vector<OrderID> asks_tails(BOOK_BUFFER, NULL_ORDER_ID);
+
+// each struct is allocated in this buffer before runtime - we never delete/alloc anything
+static std::vector<Order> orders_(BOOK_BUFFER);
+
+static std::vector<__int128_t> bids_bitmap(BITMAPSIZE);
+static std::vector<__int128_t> asks_bitmap(BITMAPSIZE);
+static std::vector<__int128_t> orders_bitmap(BITMAPSIZE);
+
+constexpr auto SUMMARY = BITMAPSIZE / 128;
+
+static std::vector<__int128_t> asks_summary(SUMMARY);
+static std::vector<__int128_t> bids_summary(SUMMARY);
+
+static std::int64_t master_ask_table = 0;
+static std::int64_t master_bid_table = 0;
+
+/**
+ * @brief Returns whether a bid order exists at a certain price
+ * @param base the base of the price
+ */
+static bool has_bid_at(const std::int64_t base) {
+    return (bids_bitmap[base / 128] & (static_cast<__int128_t>(1) << (base % 128))) != 0;
+}
+
+/**
+ * @brief Returns whether an ask order exists at a certain price
+ * @param base the base of the price
+ */
+static bool has_ask_at(const std::int64_t base) {
+    return (asks_bitmap[base / 128] & (static_cast<__int128_t>(1) << (base % 128))) != 0;
+}
+
+/**
+ * @brief Returns whether a valid order exists at a certain order id
+ * @param id the OrderID
+ */
+static bool has_order_at_id(const OrderID id) {
+    return (orders_bitmap[id / 128] & (static_cast<__int128_t>(1) << (id % 128))) != 0;
+}
 
 
-static std::map<OrderID, OrderPtr> orders_;
+// commenting this because this single function cannot do it everywhere. I might have to look for other designs
+// template <typename T>
+// void turn_on_bit_at(std::vector<T> &bitmap, const size_t index) {
+//     bitmap[index / 128] |= (static_cast<__int128_t>(1) << (index % 128));
+// }
+//
+// template <typename T>
+// void turn_off_bit_at(std::vector<T> &bitmap, const size_t index) {
+//     bitmap[index / 128] &= ~(static_cast<__int128_t>(1) << (index % 128));
+// }
+
+static int first_set_bit(const __int128_t val) {
+    if (const auto low = static_cast<uint64_t>(val); low != 0) {
+        return __builtin_ctzll(low);
+    }
+
+    if (const auto high = static_cast<uint64_t>(val >> 64); high != 0) {
+        return 64 + __builtin_ctzll(high);
+    }
+
+    return -1;
+}
+
+static int last_set_bit(const __int128_t val) {
+    if (const auto high = static_cast<uint64_t>(val >> 64); high != 0) {
+        return 64 + (63 - __builtin_clzll(high));
+    }
+
+    if (const auto low = static_cast<uint64_t>(val); low != 0) {
+        return 63 - __builtin_clzll(low);
+    }
+
+    return -1;
+}
+
+static int first_set_bit(const std::int64_t val) {
+    if (val == 0) return -1; // Not found
+    return __builtin_ctzll(val);
+}
+
+static int last_set_bit(const std::int64_t val) {
+    if (val == 0) return -1; // Not found
+    return 63 - __builtin_ctzll(val);
+}
+
+static OrderID best_bid() {
+    const std::int64_t first = last_set_bit(master_bid_table);
+    if (first == -1) return first;
+    if (const std::int64_t second = last_set_bit(bids_summary[first]); second == -1) return second;
+    const std::int64_t third = last_set_bit(bids_bitmap[first]);
+    if (third == -1) return third;
+    const OrderID final = bids_[third];
+    return final;
+}
+
+static OrderID best_ask() {
+    const std::int64_t first = first_set_bit(master_ask_table);
+    if (first == -1) return first;
+    if (const std::int64_t second = first_set_bit(asks_summary[first]); second == -1) return second;
+    const std::int64_t third = first_set_bit(asks_bitmap[first]);
+    if (third == -1) return third;
+    const auto final = asks_[third];
+    return final;
+}
 
 
 static std::string format_price(const Price &price) {
     auto digits = std::to_string(price._base);
     std::size_t fractional_digits = 0;
-    for (auto scale = price._decimals; scale > 1; scale /= 10) {
+    for (auto scale = Price::_decimals; scale > 1; scale /= 10) {
         ++fractional_digits;
     }
     if (fractional_digits == 0) {
@@ -134,7 +319,7 @@ static std::string format_price(const Price &price) {
     return digits;
 }
 
-static std::optional<Price> parse_price(std::string_view text) {
+static std::optional<Price> parse_price(const std::string_view text) {
     std::string digits;
     digits.reserve(text.size());
     std::size_t fractional_digits = 0;
@@ -155,9 +340,11 @@ static std::optional<Price> parse_price(std::string_view text) {
         }
     }
 
-    if (!saw_digit || fractional_digits > 18) {
+    if (!saw_digit || fractional_digits > static_cast<std::size_t>(DECIMAL_LIMIT)) {
         return std::nullopt;
     }
+
+    digits.append(static_cast<std::size_t>(DECIMAL_LIMIT) - fractional_digits, '0');
 
     std::uint64_t base = 0;
     const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), base);
@@ -166,12 +353,7 @@ static std::optional<Price> parse_price(std::string_view text) {
         return std::nullopt;
     }
 
-    std::int64_t scale = 1;
-    for (std::size_t i = 0; i < fractional_digits; ++i) {
-        scale *= 10;
-    }
-
-    return Price{static_cast<std::int64_t>(base), scale};
+    return Price{static_cast<std::int64_t>(base)};
 }
 
 static bool parse_unsigned(const std::string_view text, std::size_t &value) {
@@ -182,37 +364,194 @@ static bool parse_unsigned(const std::string_view text, std::size_t &value) {
     return error == std::errc{} && end == text.data() + text.size();
 }
 
+static void set_order_state(const OrderID id, const bool active) {
+    auto &word = orders_bitmap.at(id / 128);
+    const auto mask = static_cast<__int128_t>(1) << (id % 128);
+    if (active) {
+        word |= mask;
+    } else {
+        word &= ~mask;
+    }
+}
+
+/**
+ * This inputs the price base and toggles that entire bid level. You have to be sure not to call this unless ALL orders are cleared for a certain price
+ * @param base value of the base price
+ * @param active - true if you want to set it LIVE, false otherwise
+ */
+static void set_bid_state(const std::int64_t base, const bool active) {
+    const auto word_index = static_cast<std::size_t>(base / 128);
+    const auto bit_index = static_cast<std::size_t>(base % 128);
+    const auto summary_index = word_index / 128;
+    const auto summary_bit_index = word_index % 128;
+    auto &word = bids_bitmap.at(word_index);
+    auto &summary = bids_summary.at(summary_index);
+    const auto bit_mask = static_cast<__int128_t>(1) << bit_index;
+    const auto summary_mask = static_cast<__int128_t>(1) << summary_bit_index;
+    const auto master_mask = std::int64_t{1} << summary_index;
+
+    if (active) {
+        word |= bit_mask;
+        summary |= summary_mask;
+        master_bid_table |= master_mask;
+    } else {
+        word &= ~bit_mask;
+        if (word == 0) {
+            summary &= ~summary_mask;
+            if (summary == 0) {
+                master_bid_table &= ~master_mask;
+            }
+        }
+    }
+}
+
+/**
+ * This inputs the price base and toggles that entire ask level. You have to be sure not to call this unless ALL orders are cleared for a certain price
+ * @param base value of the base price
+ * @param active - true if you want to set it LIVE, false otherwise
+ */
+static void set_ask_state(const std::int64_t base, const bool active) {
+    const auto word_index = static_cast<std::size_t>(base / 128);
+    const auto bit_index = static_cast<std::size_t>(base % 128);
+    const auto summary_index = word_index / 128;
+    const auto summary_bit_index = word_index % 128;
+    auto &word = asks_bitmap.at(word_index);
+    auto &summary = asks_summary.at(summary_index);
+    const auto bit_mask = static_cast<__int128_t>(1) << bit_index;
+    const auto summary_mask = static_cast<__int128_t>(1) << summary_bit_index;
+    const auto master_mask = std::int64_t{1} << summary_index;
+
+    if (active) {
+        word |= bit_mask;
+        summary |= summary_mask;
+        master_ask_table |= master_mask;
+    } else {
+        word &= ~bit_mask;
+        if (word == 0) {
+            summary &= ~summary_mask;
+            if (summary == 0) {
+                master_ask_table &= ~master_mask;
+            }
+        }
+    }
+}
+
+/**
+ * This will evaluate the matching logic - only one bid-ask pair.
+ *
+ * Exists as a while loop in the main hot path so that it will execute until it cannot match further
+ */
+
 static bool evaluate() {
     if (bids_.empty() || asks_.empty()) {
         return false;
     }
-    auto *bid_ref = *bids_.begin();
-    auto *ask_ref = *asks_.begin();
-    Order &bid = **bid_ref;
-    Order &ask = **ask_ref;
+
+    const auto price_bid = best_bid();
+    const auto best_bid_id = bids_[price_bid];
+
+    const auto price_ask = best_ask();
+    const auto best_ask_id = asks_[price_ask];
+
+
+    if (best_bid_id == NULL_ORDER_ID || best_ask_id == NULL_ORDER_ID) {
+        return false;
+    }
+
+    auto &bid = orders_[best_bid_id];
+    auto &ask = orders_[best_ask_id];
+
     if (compare_prices(bid._price, ask._price) < 0) {
         return false;
     }
 
-    const auto bid_id = bid._id;
-    const auto ask_id = ask._id;
     const auto traded = std::min(bid._quantity, ask._quantity);
     bid._quantity -= traded;
     ask._quantity -= traded;
 
     if (bid._quantity == 0) {
-        bids_.erase(bid_ref);
-        orders_.erase(bid_id);
+        const auto prev_id = bid.prev;
+        const auto next_id = bid.next;
+
+        if (prev_id == NULL_ORDER_ID) {
+            // update price level head
+            bids_[price_bid] = bid.next;
+            if (bid.next != NULL_ORDER_ID) {
+                // clear new head's prev pointer
+                orders_[bid.next].prev = NULL_ORDER_ID;
+            } else {
+                // if next is also NULL - the entire price level is now empty
+                bids_tails[price_bid] = NULL_ORDER_ID;
+                set_bid_state(orders_[price_bid]._price._base, false);
+            }
+        }
+
+        if (next_id == NULL_ORDER_ID) {
+            // meaning this is the tail - we have to update the tail
+            bids_tails[price_bid] = prev_id;
+            if (prev_id != NULL_ORDER_ID) {
+                orders_[prev_id].next = NULL_ORDER_ID;
+            }
+        }
+
+
+        if (prev_id != NULL_ORDER_ID) {
+            auto &prev_order = orders_[prev_id];
+            prev_order.next = next_id;
+        }
+
+        if (next_id != NULL_ORDER_ID) {
+            auto &next_order = orders_[next_id];
+            next_order.prev = prev_id;
+        }
+
+        set_order_state(best_bid_id, false);
     }
+
     if (ask._quantity == 0) {
-        asks_.erase(ask_ref);
-        orders_.erase(ask_id);
+        const auto prev_id = ask.prev;
+        const auto next_id = ask.next;
+
+        if (prev_id == NULL_ORDER_ID) {
+            // update price level head
+            asks_[price_ask] = ask.next;
+            if (ask.next != NULL_ORDER_ID) {
+                // clear new head's prev pointer
+                orders_[ask.next].prev = NULL_ORDER_ID;
+            } else {
+                // if next is also NULL - the entire price level is now empty
+                asks_tails[price_ask] = NULL_ORDER_ID;
+                set_ask_state(orders_[price_ask]._price._base, false);
+            }
+        }
+
+        if (next_id == NULL_ORDER_ID) {
+            // meaning this is the tail - we have to update the tail
+            asks_tails[price_ask] = prev_id;
+            if (prev_id != NULL_ORDER_ID) {
+                orders_[prev_id].next = NULL_ORDER_ID;
+            }
+        }
+
+        if (prev_id != NULL_ORDER_ID) {
+            auto &prev_order = orders_[prev_id];
+            prev_order.next = next_id;
+        }
+
+        if (next_id != NULL_ORDER_ID) {
+            auto &next_order = orders_[next_id];
+            next_order.prev = prev_id;
+        }
+
+
+        set_order_state(best_ask_id, false);
     }
     return true;
 }
 
-static void execute_market_order(Order &incoming) {
-    const auto consume = [&](auto &opposite) {
+
+/*
+const auto consume = [&](auto &opposite) {
         while (incoming._quantity > 0 && !opposite.empty()) {
             auto *resting_ref = *opposite.begin();
             Order &resting = **resting_ref;
@@ -232,56 +571,126 @@ static void execute_market_order(Order &incoming) {
     } else {
         consume(bids_);
     }
+
+ */
+
+
+static void execute_market_order(Order &incoming) {
 }
 
-static void add_order(OrderPtr &order) {
-    if (order->_quantity == 0) {
+
+static void add_order(const Order &order_info) {
+    if (order_info._quantity == 0) {
         return;
     }
 
-    order->_id = global_order_id++;
-    if (order->_price._base == MKTORDER._base &&
-        order->_price._decimals == MKTORDER._decimals) {
-        execute_market_order(*order);
+    auto &order = orders_[global_order_id++];
+
+    order._id = global_order_id - 1;
+    order._price = order_info._price;
+    order._side = order_info._side;
+    order._quantity = order_info._quantity;
+    order._timestamp = now();
+
+    if (order_info._price._base == MKTORDER._base) {
+        execute_market_order(order);
         return;
     }
 
-    const auto id = order->_id;
+    const auto id = order._id;
 
-    auto [it, inserted] = orders_.emplace(id, std::move(order));
-    if (!inserted) {
-        return;
+    const auto base = order._price._base;
+    if (order._side == Side::BUY) {
+        //pehle check if there already exists some orders on the base/level
+        if (has_bid_at(base)) {
+            //if orders exist - append onto the tail
+            const OrderID tail = bids_tails[base];
+            orders_[tail].next = id;
+            order.next = NULL_ORDER_ID;
+            order.prev = tail;
+            bids_tails[base] = id;
+        } else {
+            //this base/level has no orders. This is the first one
+            //setting next and prev to NULL in case this was a past order that is being used again
+            order.next = NULL_ORDER_ID;
+            order.prev = NULL_ORDER_ID;
+            bids_[base] = id;
+            bids_tails[base] = id;
+            set_bid_state(base, true);
+        }
+    } else if (order._side == Side::SELL) {
+        if (has_ask_at(base)) {
+            //if orders exist - append onto the tail
+            const OrderID tail = asks_tails[base];
+            orders_[tail].next = id;
+            order.next = NULL_ORDER_ID;
+            order.prev = tail;
+            asks_tails[base] = id;
+        } else {
+            //this base/level has no orders. This is the first one
+            //setting next and prev to NULL in case this was a past order that is being used again
+            order.next = NULL_ORDER_ID;
+            order.prev = NULL_ORDER_ID;
+            asks_[base] = id;
+            asks_tails[base] = id;
+            set_ask_state(base, true);
+        }
     }
 
-    OrderPtr *const order_ref = &it->second;
-    if (it->second->_side == Side::BUY) {
-        bids_.insert(order_ref);
-    } else if (it->second->_side == Side::SELL) {
-        asks_.insert(order_ref);
-    } else {
-        orders_.erase(it);
-        return;
-    }
-
+    // execute the matching for best bid and ask order until you can
     while (evaluate()) {
     }
 }
 
 static void cancel_order(const OrderID order_id) {
-    const auto it = orders_.find(order_id);
-    if (it == orders_.end()) {
-        //std::cerr << "Order " << order_id << " does not exist" << std::endl;
+    if (!has_order_at_id(order_id)) {
         return;
     }
+    const auto &order = orders_[order_id];
+    const auto prev = order.prev;
+    const auto next = order.next;
 
-    if (it->second->_side == Side::BUY) {
-        bids_.erase(&it->second);
-    } else {
-        asks_.erase(&it->second);
+    if (prev != NULL_ORDER_ID) {
+        orders_[prev].next = next;
     }
-    orders_.erase(it);
 
-    // std::cerr << "Order " << order_id << " canceled" << std::endl;
+    if (next != NULL_ORDER_ID) {
+        orders_[next].prev = prev;
+    }
+
+    if (order._side == Side::BUY) {
+        if (order.next == NULL_ORDER_ID && order.prev == NULL_ORDER_ID) {
+            //only order at this price level
+            set_bid_state(order._price._base, false);
+        }
+
+        if (prev == NULL_ORDER_ID) {
+            //if this order was HEAD of the DLL - change the head
+            bids_[order._price._base] = order.next;
+        }
+
+        if (next == NULL_ORDER_ID) {
+            //order was TAIL of the DLL - change the tail
+            bids_tails[order._price._base] = order.prev;
+        }
+    } else {
+        if (order.next == NULL_ORDER_ID && order.prev == NULL_ORDER_ID) {
+            //only order at this price level
+            set_ask_state(order._price._base, false);
+        }
+
+        if (prev == NULL_ORDER_ID) {
+            //if this order was HEAD of the DLL - change the head
+            asks_[order._price._base] = order.next;
+        }
+
+        if (next == NULL_ORDER_ID) {
+            //order was TAIL of the DLL - change the tail
+            asks_tails[order._price._base] = order.prev;
+        }
+    }
+
+    set_order_state(order_id, false);
 }
 
 
@@ -289,64 +698,97 @@ static void modify_order(const OrderID order_id,
                          const std::optional<Price> price,
                          const std::optional<Side> side,
                          const std::optional<Quantity> quantity) {
-    const auto it = orders_.find(order_id);
-    if (it == orders_.end()) {
-        //std::cerr << "Order " << order_id << " does not exist" << "\n";
+    if (!has_order_at_id(order_id)) {
+        std::cerr << "Order " << order_id << " does not exist" << "\n";
         return;
     }
+
+    auto &order = orders_[order_id];
 
     if (quantity && *quantity == 0) {
         return;
     }
 
-    Order &order = *it->second;
+
     const Side new_side = side.value_or(order._side);
     const Price new_price = price.value_or(order._price);
     const Quantity new_quantity = quantity.value_or(order._quantity);
-    const bool becomes_market =
-            new_price._base == MKTORDER._base && new_price._decimals == MKTORDER._decimals;
-
-    if (order._side == Side::BUY) {
-        bids_.erase(&it->second);
-    } else {
-        asks_.erase(&it->second);
-    }
-
-    if (new_side != order._side || compare_prices(new_price, order._price) != 0 ||
-        new_quantity > order._quantity) {
-        order._timestamp = std::chrono::steady_clock::now();
-    }
-    order._price = new_price;
-    order._side = new_side;
-    order._quantity = new_quantity;
+    const bool becomes_market = new_price._base == MKTORDER._base;
+    const bool priority_lost = (compare_prices(new_price, order._price) != 0) || (new_side != order._side) || (
+                                   new_quantity > order._quantity);
 
     if (becomes_market) {
+        cancel_order(order_id);
+        order._price = MKTORDER;
+        order._side = new_side;
+        order._quantity = new_quantity;
         execute_market_order(order);
-        orders_.erase(it);
         return;
     }
+    if (priority_lost) {
+        // unlinks from old price level & deactivates
+        cancel_order(order_id);
 
-    if (new_side == Side::BUY) {
-        bids_.insert(&it->second);
+        order._price = new_price;
+        order._side = new_side;
+        order._quantity = new_quantity;
+        order._timestamp = now();
+
+        // reactivate order state
+        set_order_state(order_id, true);
+
+        // re-insert into the new price level
+        const auto base = order._price._base;
+        if (order._side == Side::BUY) {
+            if (has_bid_at(base)) {
+                const OrderID tail = bids_tails[base];
+                orders_[tail].next = order_id;
+                order.next = NULL_ORDER_ID;
+                order.prev = tail;
+                bids_tails[base] = order_id;
+            } else {
+                order.next = NULL_ORDER_ID;
+                order.prev = NULL_ORDER_ID;
+                bids_[base] = order_id;
+                bids_tails[base] = order_id;
+                set_bid_state(base, true);
+            }
+        } else {
+            if (has_ask_at(base)) {
+                const OrderID tail = asks_tails[base];
+                orders_[tail].next = order_id;
+                order.next = NULL_ORDER_ID;
+                order.prev = tail;
+                asks_tails[base] = order_id;
+            } else {
+                order.next = NULL_ORDER_ID;
+                order.prev = NULL_ORDER_ID;
+                asks_[base] = order_id;
+                asks_tails[base] = order_id;
+                set_ask_state(base, true);
+            }
+        }
     } else {
-        asks_.insert(&it->second);
+        order._quantity = new_quantity;
     }
     while (evaluate()) {
     }
 }
 
 static Price get_best_bid() {
-    if (bids_.empty()) {
+    const auto bid = best_bid();
+    if (bid == 01) {
         return INVALID;
     }
-    return (*bids_.begin())->get()->_price;
+    return orders_[bid]._price;
 }
 
 static Price get_best_ask() {
-    if (asks_.empty()) {
+    const auto ask = best_ask();
+    if (ask == 01) {
         return INVALID;
     }
-    return (*asks_.begin())->get()->_price;
+    return orders_[ask]._price;
 }
 
 
@@ -359,60 +801,264 @@ static void get_top_levels(const size_t depth,
     bids_out.clear();
     asks_out.clear();
 
+    // walk bids from highest price to lowest price using the hierarchical bitmaps
+    std::int64_t master_bids = master_bid_table;
+    while (master_bids != 0 && bids_out.size() < depth) {
+        const int master_bit = last_set_bit(master_bids);
+        if (master_bit < 0) break;
 
-    {
-        Price current_price{-1, -1};
-        Quantity cumulative_qty = 0;
+        std::int64_t summary_word = bids_summary[master_bit];
+        while (summary_word != 0 && bids_out.size() < depth) {
+            const int summary_bit = last_set_bit(summary_word);
+            if (summary_bit < 0) break;
 
-        for (const auto *order_ptr_ref: bids_) {
-            const Order &order = **order_ptr_ref;
+            const std::size_t word_index = (master_bit * 128) + summary_bit;
+            __int128_t bitmap_word = bids_bitmap[word_index];
 
-            if (current_price._base == -1 || compare_prices(order._price, current_price) != 0) {
-                if (current_price._base != -1) {
-                    bids_out.emplace_back(current_price, cumulative_qty);
-                    if (bids_out.size() >= depth) break;
+            while (bitmap_word != 0 && bids_out.size() < depth) {
+                const int bit_index = last_set_bit(bitmap_word);
+                if (bit_index < 0) break;
+
+                const std::int64_t price_base = (word_index * 128) + bit_index;
+
+                // traverse intrusive linked list at this price level to sum quantities
+                Quantity cumulative_qty = 0;
+                OrderID current_id = bids_[price_base];
+                while (current_id != NULL_ORDER_ID) {
+                    const auto &ord = orders_[current_id];
+                    cumulative_qty += ord._quantity;
+                    current_id = ord.next;
                 }
-                current_price = order._price;
-                cumulative_qty = order._quantity;
-            } else {
-                cumulative_qty += order._quantity;
+
+                bids_out.emplace_back(Price{price_base}, cumulative_qty);
+
+                // clear this bit in our local copy to find the next one
+                bitmap_word &= ~(static_cast<__int128_t>(1) << bit_index);
             }
+            summary_word &= ~(static_cast<__int128_t>(1) << summary_bit);
         }
-        if (current_price._base != -1 && bids_out.size() < depth) {
-            bids_out.emplace_back(current_price, cumulative_qty);
-        }
+        master_bids &= ~(std::int64_t{1} << master_bit);
     }
 
+    // walk asks from lowest price to highest price using the hierarchical bitmaps
+    std::int64_t master_asks = master_ask_table;
+    while (master_asks != 0 && asks_out.size() < depth) {
+        const int master_bit = first_set_bit(master_asks);
+        if (master_bit < 0) break;
 
-    {
-        Price current_price{-1, -1};
-        Quantity cumulative_qty = 0;
+        std::int64_t summary_word = asks_summary[master_bit];
+        while (summary_word != 0 && asks_out.size() < depth) {
+            const int summary_bit = first_set_bit(summary_word);
+            if (summary_bit < 0) break;
 
-        for (const auto *order_ptr_ref: asks_) {
-            const Order &order = **order_ptr_ref;
+            const std::size_t word_index = (master_bit * 128) + summary_bit;
+            __int128_t bitmap_word = asks_bitmap[word_index];
 
-            if (current_price._base == -1 || compare_prices(order._price, current_price) != 0) {
-                if (current_price._base != -1) {
-                    asks_out.emplace_back(current_price, cumulative_qty);
-                    if (asks_out.size() >= depth) break;
+            while (bitmap_word != 0 && asks_out.size() < depth) {
+                const int bit_index = first_set_bit(bitmap_word);
+                if (bit_index < 0) break;
+
+                const std::int64_t price_base = (word_index * 128) + bit_index;
+
+                // traverse intrusive linked list at this price level to sum quantities
+                Quantity cumulative_qty = 0;
+                OrderID current_id = asks_[price_base];
+                while (current_id != NULL_ORDER_ID) {
+                    const auto &ord = orders_[current_id];
+                    cumulative_qty += ord._quantity;
+                    current_id = ord.next;
                 }
-                current_price = order._price;
-                cumulative_qty = order._quantity;
-            } else {
-                cumulative_qty += order._quantity;
+
+                asks_out.emplace_back(Price{price_base}, cumulative_qty);
+
+                // clear this bit in our local copy to find the next one
+                bitmap_word &= ~(static_cast<__int128_t>(1) << bit_index);
+            }
+            summary_word &= ~(static_cast<__int128_t>(1) << summary_bit);
+        }
+        master_asks &= ~(std::int64_t{1} << master_bit);
+    }
+}
+
+namespace {
+    struct DashboardSnapshot {
+        std::vector<PriceQuantityPair> bids;
+        std::vector<PriceQuantityPair> asks;
+        std::string input;
+        std::string status;
+    };
+}
+
+static std::mutex dashboard_mutex;
+static DashboardSnapshot dashboard_snapshot;
+
+static void publish_dashboard_snapshot() {
+    DashboardSnapshot next;
+    get_top_levels(10, next.bids, next.asks);
+
+    std::lock_guard lock(dashboard_mutex);
+    next.input = dashboard_snapshot.input;
+    next.status = dashboard_snapshot.status;
+    dashboard_snapshot = std::move(next);
+}
+
+static void update_dashboard_input(const std::string &input) {
+    std::lock_guard lock(dashboard_mutex);
+    dashboard_snapshot.input = input;
+}
+
+static void update_dashboard_status(std::string status) {
+    std::lock_guard lock(dashboard_mutex);
+    dashboard_snapshot.status = std::move(status);
+}
+
+static void render_dashboard() {
+    DashboardSnapshot snapshot;
+    {
+        std::lock_guard lock(dashboard_mutex);
+        snapshot = dashboard_snapshot;
+    }
+
+    const auto max_quantity = [](const auto &levels) {
+        Quantity maximum = 0;
+        for (const auto &[price, quantity]: levels) {
+            maximum = std::max(maximum, quantity);
+        }
+        return maximum;
+    };
+    std::cout << "\033[2J\033[H"
+            << "\033[1;36m"
+            << "  ORDERBOOK  |  LIVE MARKET DEPTH"
+            << "\033[0m\n";
+
+    const auto render_side = [](const char *heading,
+                                const auto &levels,
+                                const bool is_ask,
+                                const char *color,
+                                const Quantity side_max) {
+        constexpr std::size_t bar_width = 24;
+        std::cout << "  " << color << heading << "\033[0m\n"
+                << "  " << std::setw(16) << "PRICE"
+                << std::setw(14) << "QUANTITY"
+                << "  | VOLUME\n";
+
+        for (std::size_t row = 0; row < levels.size(); ++row) {
+            const auto index = is_ask ? levels.size() - 1 - row : row;
+            const auto &[price, quantity] = levels[index];
+            const auto scaled = static_cast<unsigned __int128>(quantity) * bar_width;
+            const auto filled = side_max == 0
+                                    ? 0
+                                    : std::max<std::size_t>(
+                                        1, static_cast<std::size_t>(scaled / side_max));
+            const auto bounded_filled = std::min(filled, bar_width);
+
+            std::cout << "  " << std::setw(16) << format_price(price)
+                    << std::setw(14) << quantity
+                    << "  | " << color
+                    << std::string(bounded_filled, '=')
+                    << "\033[2m"
+                    << std::string(bar_width - bounded_filled, '-')
+                    << "\033[0m\n";
+        }
+        std::cout << '\n';
+    };
+
+    render_side("ASKS / SELL", snapshot.asks, true, "\033[31m", max_quantity(snapshot.asks));
+    render_side("BIDS / BUY", snapshot.bids, false, "\033[32m", max_quantity(snapshot.bids));
+
+    std::cout << "  " << snapshot.status << "\n"
+            << "  \033[1;36m>\033[0m " << snapshot.input
+            << "\033[?25l" << std::flush;
+}
+
+namespace {
+    class TerminalSession {
+    public:
+        explicit TerminalSession(const bool enabled) {
+            if (!enabled || tcgetattr(STDIN_FILENO, &original_) != 0) {
+                return;
+            }
+            termios raw = original_;
+            raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO | ISIG));
+            raw.c_cc[VMIN] = 1;
+            raw.c_cc[VTIME] = 0;
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+                active_ = true;
+                std::cout << "\033[?1049h\033[?25l" << std::flush;
             }
         }
-        if (current_price._base != -1 && asks_out.size() < depth) {
-            asks_out.emplace_back(current_price, cumulative_qty);
+
+        ~TerminalSession() {
+            if (active_) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &original_);
+                std::cout << "\033[0m\033[?25h\033[?1049l" << std::flush;
+            }
+        }
+
+        [[nodiscard]] bool active() const {
+            return active_;
+        }
+
+    private:
+        termios original_{};
+        bool active_ = false;
+    };
+}
+
+static bool read_terminal_command(std::string &command) {
+    command.clear();
+    update_dashboard_input(command);
+
+    while (true) {
+        pollfd input_fd{STDIN_FILENO, POLLIN, 0};
+        const auto poll_result = poll(&input_fd, 1, 100);
+        if (poll_result < 0) {
+            return false;
+        }
+        if (poll_result == 0) {
+            continue;
+        }
+
+        char ch = '\0';
+        const auto bytes_read = read(STDIN_FILENO, &ch, 1);
+        if (bytes_read <= 0) {
+            return false;
+        }
+        if (ch == '\n' || ch == '\r') {
+            update_dashboard_input("");
+            return true;
+        }
+        if (ch == 4 && command.empty()) {
+            return false;
+        }
+        if (ch == 3) {
+            return false;
+        }
+        if (ch == 127 || ch == '\b') {
+            if (!command.empty()) {
+                command.pop_back();
+                update_dashboard_input(command);
+            }
+            continue;
+        }
+        if (ch >= 32 && ch < 127) {
+            command.push_back(ch);
+            update_dashboard_input(command);
         }
     }
 }
 
+
+//this function is only for convenience - there wouldn't be any moment in HFT industry when you would want to reset an orderbook in live prod
+
+/**
+ * if you are calling this function - you are either very smart or so dumb that you cannot even comprehend the level of your dumbness UwU
+ */
 static void reset() {
     asks_ = {};
     bids_ = {};
     orders_.clear();
-    //std::cout << "EVERYTHING ERASED." << "\n";
+    std::cout << "EVERYTHING ERASED." << "\n";
 }
 
 constexpr std::string BUY = "buy";
@@ -425,24 +1071,6 @@ constexpr std::string GET_BEST_ASK = "gba";
 constexpr std::string GET_TOP_LEVELS = "gtl";
 
 
-static void print_order_book() {
-    std::cout << "______________________________________" << "\n";
-    std::cout << "SELL ORDERS ->" << "\n";
-
-    for (const auto order: asks_) {
-        std::print("{} {} {}\n", order->get()->_id, order->get()->_quantity,
-                   format_price(order->get()->_price));
-    }
-    std::cout << "______________________________________" << "\n";
-    std::cout << "BUY ORDERS ->" << "\n";
-
-    for (const auto order: bids_) {
-        std::print("{} {} {}\n", order->get()->_id, order->get()->_quantity,
-                   format_price(order->get()->_price));
-    }
-    std::cout << "______________________________________" << "\n";
-}
-
 int main() {
     //excluding the metadata overhead + null terminator - we have 231 bytes worth of space for commands - HIGHLY unlikely to do another heap alloc
     std::string command;
@@ -451,21 +1079,35 @@ int main() {
     command.reserve(CacheLineSize);
     std::vector<PriceQuantityPair> bids_out(10);
     std::vector<PriceQuantityPair> asks_out(10);
-    //usage:
-    /*
-     * for buy/sell
-     * <side> <qty> <price (or leave empty for market orders)>
-     *
-     * reset -
-     * reset
-     *
-     * modifying -
-     *
-     * modify <order_id(REQUIRED EXISTING ORDER)> <side(-1 for no change)> <qty(-1 for no change)> <price(-2 for turning it into a market order, -1 for no change)>
-     */
 
+    const bool interactive = ENABLE_LIVE_DASHBOARD &&
+                             isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    TerminalSession terminal(interactive);
+    std::atomic render_running{false};
+    std::thread renderer;
+    if (interactive && terminal.active()) {
+        update_dashboard_status("buy/sell <qty> [price] | cancel <id> | gbb | gba | reset | exit");
 
-    while (std::getline(std::cin, command)) {
+        publish_dashboard_snapshot();
+
+        render_running.store(true, std::memory_order_release);
+        renderer = std::thread([&] {
+            while (render_running.load(std::memory_order_acquire)) {
+                render_dashboard();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+
+    while (true) {
+        if (interactive && terminal.active()) {
+            if (!read_terminal_command(command)) {
+                break;
+            }
+        } else if (!std::getline(std::cin, command)) {
+            break;
+        }
+
         tokens.clear();
         bool too_many_tokens = false;
 
@@ -513,15 +1155,24 @@ int main() {
             if (tokens.size() != 2 || !parse_unsigned(tokens[1], id)) {
                 continue;
             }
+
             cancel_order(id);
+
+
+            publish_dashboard_snapshot();
         } else if (tokens[0] == GET_BEST_BID || tokens[0] == GET_BEST_ASK) {
             if (tokens.size() != 1) {
                 continue;
             }
             const Price best = tokens[0] == GET_BEST_BID ? get_best_bid() : get_best_ask();
 
-            std::print("{}={}\n", tokens[0] == GET_BEST_BID ? "best_bid" : "best_ask",
-                       best._base == INVALID._base && best._decimals == INVALID._decimals ? "-1" : format_price(best));
+            const auto result = std::string(tokens[0] == GET_BEST_BID ? "best_bid=" : "best_ask=") +
+                                (best._base == INVALID._base ? "-1" : format_price(best));
+            if (interactive && terminal.active()) {
+                update_dashboard_status(result);
+            } else {
+                std::cout << result << '\n';
+            }
         } else if (tokens[0] == BUY || tokens[0] == SELL) {
             std::size_t quantity = 0;
             const auto price = tokens.size() == 3 ? parse_price(tokens[2]) : std::optional<Price>{};
@@ -533,21 +1184,14 @@ int main() {
 
             // Valid: buy|sell <quantity> [price]
             // No price token means market order.
-            auto order = std::make_unique<Order>();
-            if (tokens[0] == BUY) {
-                order->_side = Side::BUY;
-            } else {
-                order->_side = Side::SELL;
-            }
+            Order temp_order{};
+            temp_order._side = (tokens[0] == BUY) ? Side::BUY : Side::SELL;
+            temp_order._quantity = quantity;
+            temp_order._price = (tokens.size() == 3) ? *price : MKTORDER;
 
-            order->_quantity = quantity;
-            if (tokens.size() == 3) {
-                order->_price = *price;
-            } else {
-                order->_price = MKTORDER;
-            }
+            add_order(temp_order);
 
-            add_order(order);
+            publish_dashboard_snapshot();
         } else if (tokens[0] == RESET) {
             if (tokens.size() != 1) {
                 continue;
@@ -556,6 +1200,8 @@ int main() {
             // Valid: reset
 
             reset();
+
+            publish_dashboard_snapshot();
         } else if (tokens[0] == MODIFY) {
             std::size_t id = 0;
             std::size_t quantity = 0;
@@ -567,8 +1213,8 @@ int main() {
                 continue;
             }
 
-            const auto existing = orders_.find(id);
-            if (existing == orders_.end()) {
+            const auto existing = has_order_at_id(id);
+            if (!existing) {
                 modify_order(id, std::nullopt, std::nullopt, std::nullopt);
                 continue;
             }
@@ -592,19 +1238,19 @@ int main() {
             }
 
             // -1 preserves a field, price -2 converts it into a market order.
-            const Price requested_price = new_price.value_or(existing->second->_price);
-            if (requested_price._base < 0 &&
-                !(requested_price._base == MKTORDER._base &&
-                  requested_price._decimals == MKTORDER._decimals)) {
+            const Price requested_price = new_price.value_or(orders_[id]._price);
+            if (requested_price._base < 0 && requested_price._base != MKTORDER._base) {
                 continue;
             }
 
-            const Side requested_side = side.value_or(existing->second->_side);
+            const Side requested_side = side.value_or(orders_[id]._side);
             if (requested_side == Side::VOID) {
                 continue;
             }
 
             modify_order(id, new_price, side, new_quantity);
+
+            publish_dashboard_snapshot();
         } else if (tokens[0] == GET_TOP_LEVELS) {
             if (tokens.size() != 2) {
                 continue;
@@ -615,12 +1261,16 @@ int main() {
             }
 
             get_top_levels(levels, bids_out, asks_out);
-            //std::cerr << "Unknown command: " << tokens[0] << '\n';
+            std::cerr << "Unknown command: " << tokens[0] << '\n';
             continue;
         }
 
-        // std::cout << "[Parsed] : " << command << '\n';
-        // print_order_book();
+        std::cout << "[Parsed] : " << command << '\n';
+    }
+
+    if (renderer.joinable()) {
+        render_running.store(false, std::memory_order_release);
+        renderer.join();
     }
 
     return 0;
